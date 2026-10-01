@@ -136,7 +136,7 @@ $('#refresh-list').addEventListener('click', loadWorks);
 
 async function openWork(id) {
   const r = await api('GET', `/api/works/${id}`);
-  state.current = { work: r.work, cues: r.cues, dirty: new Set() };
+  state.current = { work: r.work, cues: r.cues, dirty: new Set(), selected: new Set() };
 
   $('#empty-view').hidden = true;
   $('#work-view').hidden = false;
@@ -149,6 +149,7 @@ async function openWork(id) {
   $('#work-updated').textContent = r.work.updated_at;
   $('#export-link').href = `/api/works/${id}/export`;
 
+  resetShiftPanel();
   renderCues();
   await loadWorks();
 }
@@ -160,6 +161,21 @@ function renderCues() {
   for (const cue of state.current.cues) {
     const tr = document.createElement('tr');
     tr.dataset.cueId = cue.id;
+
+    // 批量平移勾选
+    const selTd = document.createElement('td');
+    selTd.className = 'col-sel';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.className = 'cue-sel';
+    cb.checked = state.current.selected.has(cue.id);
+    cb.addEventListener('change', () => {
+      if (cb.checked) state.current.selected.add(cue.id);
+      else state.current.selected.delete(cue.id);
+      updateShiftCount();
+      invalidatePreview();
+    });
+    selTd.appendChild(cb);
 
     const idxTd = document.createElement('td');
     idxTd.className = 'col-idx';
@@ -213,7 +229,7 @@ function renderCues() {
     startInput.addEventListener('input', onEdit);
     endInput.addEventListener('input', onEdit);
 
-    tr.append(idxTd, startTd, endTd, textTd, saveTd);
+    tr.append(selTd, idxTd, startTd, endTd, textTd, saveTd);
     tbody.appendChild(tr);
   }
 }
@@ -292,6 +308,7 @@ async function saveCue(tr, cue, els) {
     rowMsg.textContent = `已保存（修订号 ${r.revision}）`;
     $('#work-revision').textContent = r.revision;
     $('#stale-banner').hidden = true;
+    invalidatePreview(); // 修订号已推进，旧的平移预览不能再用于确认
   } catch (err) {
     tr.classList.add('row-err');
     rowMsg.classList.add('error');
@@ -338,6 +355,179 @@ async function saveCue(tr, cue, els) {
     tr.classList.remove('saving');
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* 批量平移：选段 -> 预览 -> 应用                                       */
+/* ------------------------------------------------------------------ */
+
+const shiftState = { preview: null }; // 最近一次预览结果（确认时携带其修订号）
+
+function shiftSelectedIds() {
+  return state.current ? [...state.current.selected] : [];
+}
+
+function invalidatePreview() {
+  shiftState.preview = null;
+  $('#shift-result').innerHTML = '';
+  $('#shift-apply').disabled = true;
+}
+
+function updateShiftCount() {
+  $('#shift-count').textContent = state.current ? state.current.selected.size : 0;
+}
+
+function resetShiftPanel() {
+  invalidatePreview();
+  $('#shift-offset').value = '';
+  const msg = $('#shift-msg');
+  msg.className = 'msg';
+  msg.textContent = '';
+  updateShiftCount();
+}
+
+/** 严格解析有符号整数毫秒；非法返回 null */
+function parseOffsetInput() {
+  const raw = $('#shift-offset').value.trim();
+  if (!/^[+-]?\d+$/.test(raw)) return null;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+function setAllSelected(on) {
+  if (!state.current) return;
+  state.current.selected = on ? new Set(state.current.cues.map((c) => c.id)) : new Set();
+  document.querySelectorAll('#cue-tbody .cue-sel').forEach((cb) => {
+    cb.checked = on;
+  });
+  updateShiftCount();
+  invalidatePreview();
+}
+
+$('#shift-select-all').addEventListener('click', () => setAllSelected(true));
+$('#shift-clear').addEventListener('click', () => setAllSelected(false));
+$('#shift-offset').addEventListener('input', invalidatePreview);
+
+function renderShiftResult(p) {
+  const box = $('#shift-result');
+  box.innerHTML = '';
+
+  const head = document.createElement('p');
+  head.className = `shift-summary ${p.ok ? 'ok' : 'bad'}`;
+  head.textContent = p.ok
+    ? `依据修订号 ${p.revision}：${p.items.length} 段可整体平移，无碰撞。确认应用将携带该修订号。`
+    : `依据修订号 ${p.revision}：${p.problems.map((x) => x.message).join('；')}，无法应用。`;
+  box.appendChild(head);
+
+  const table = document.createElement('table');
+  table.className = 'shift-table';
+  const thead = document.createElement('thead');
+  thead.innerHTML = '<tr><th>段</th><th>调整前</th><th>调整后</th><th>碰撞对象</th></tr>';
+  table.appendChild(thead);
+
+  const tbody = document.createElement('tbody');
+  for (const item of p.items) {
+    const tr = document.createElement('tr');
+    if (item.negative_start || item.collisions.length > 0) tr.classList.add('shift-bad');
+
+    const idx = document.createElement('td');
+    idx.textContent = `第 ${item.idx} 段`;
+
+    const before = document.createElement('td');
+    before.textContent = `${item.before.start} → ${item.before.end}`;
+
+    const after = document.createElement('td');
+    after.textContent =
+      `${item.after.start} → ${item.after.end}` + (item.negative_start ? '（起点为负）' : '');
+
+    const coll = document.createElement('td');
+    coll.textContent =
+      item.collisions.length === 0
+        ? '—'
+        : item.collisions
+            .map((c) => `第 ${c.idx} 段 ${c.start}–${c.end}${c.selected ? '（同批）' : ''}`)
+            .join('；');
+
+    tr.append(idx, before, after, coll);
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  box.appendChild(table);
+
+  $('#shift-apply').disabled = !p.ok;
+}
+
+$('#shift-preview').addEventListener('click', async () => {
+  const msg = $('#shift-msg');
+  msg.className = 'msg';
+  msg.textContent = '';
+  if (!state.current) return;
+
+  const ids = shiftSelectedIds();
+  if (ids.length === 0) {
+    msg.classList.add('error');
+    msg.textContent = '请先勾选要平移的字幕段';
+    return;
+  }
+  const offset = parseOffsetInput();
+  if (offset === null) {
+    msg.classList.add('error');
+    msg.textContent = '偏移量必须是有符号整数毫秒（如 -500 或 2000）';
+    return;
+  }
+
+  try {
+    const p = await api('POST', `/api/works/${state.current.work.id}/shift/preview`, {
+      cue_ids: ids,
+      offset_ms: offset,
+    });
+    shiftState.preview = p;
+    renderShiftResult(p);
+  } catch (err) {
+    invalidatePreview();
+    msg.classList.add('error');
+    msg.textContent = err.message;
+  }
+});
+
+$('#shift-apply').addEventListener('click', async () => {
+  const p = shiftState.preview;
+  const msg = $('#shift-msg');
+  if (!state.current || !p || !p.ok) return;
+  msg.className = 'msg';
+  msg.textContent = '';
+
+  const workId = state.current.work.id;
+  try {
+    const r = await api('POST', `/api/works/${workId}/shift`, {
+      cue_ids: shiftSelectedIds(),
+      offset_ms: p.offset_ms,
+      revision: p.revision, // 预览所依据的修订号
+      editor: state.editor || null,
+    });
+    await openWork(workId);
+    const done = $('#shift-msg');
+    done.className = 'msg ok';
+    done.textContent = `已平移 ${r.shifted} 段（新修订号 ${r.revision}），展示序号已重排。`;
+  } catch (err) {
+    msg.classList.add('error');
+    if (err.status === 409 && err.data.error === 'revision_stale') {
+      // 作品已被他人改动：未按过期预览写入，提示重新载入
+      state.current.work.revision = err.data.latest_revision;
+      $('#work-revision').textContent = err.data.latest_revision;
+      $('#stale-rev').textContent = err.data.latest_revision;
+      $('#stale-banner').hidden = false;
+      invalidatePreview();
+      msg.textContent =
+        `作品已被他人修改（最新修订号 ${err.data.latest_revision}），本次未写入。` +
+        '请重新载入后重新预览。';
+    } else if (err.status === 422) {
+      invalidatePreview();
+      msg.textContent = `${err.message}。可调整选择或偏移量后重新预览。`;
+    } else {
+      msg.textContent = err.message;
+    }
+  }
+});
 
 /* ------------------------------------------------------------------ */
 /* 离开页面前提醒未保存修改                                            */

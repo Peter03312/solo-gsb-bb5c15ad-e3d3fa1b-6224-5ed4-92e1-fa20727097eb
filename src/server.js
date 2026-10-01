@@ -96,6 +96,160 @@ function normalizeText(text) {
   return t;
 }
 
+/** 有符号毫秒 -> 时间码；负数带前导负号（批量平移预览/报错展示用） */
+function formatSignedMs(ms) {
+  return ms < 0 ? `-${formatMs(-ms)}` : formatMs(ms);
+}
+
+/**
+ * 解析批量平移的公共参数：
+ *   cue_ids   非空、正整数、不重复的字幕段标识数组
+ *   offset_ms 有符号整数毫秒偏移量
+ * 任何一项非法都抛 400，与作品数据无关，进事务前先挡住。
+ */
+function parseShiftParams(body) {
+  const { cue_ids: cueIds, offset_ms: offsetMs } = body || {};
+
+  if (!Array.isArray(cueIds) || cueIds.length === 0) {
+    throw new HttpError(400, 'empty_selection', '请至少选择一个要平移的字幕段');
+  }
+  if (cueIds.some((id) => !Number.isInteger(id) || id < 1)) {
+    throw new HttpError(400, 'invalid_cue_ids', '字幕段标识必须为正整数数组');
+  }
+  const seen = new Set();
+  const duplicates = new Set();
+  for (const id of cueIds) {
+    if (seen.has(id)) duplicates.add(id);
+    seen.add(id);
+  }
+  if (duplicates.size > 0) {
+    throw new HttpError(400, 'duplicate_cues', '选择中存在重复的字幕段', {
+      duplicates: [...duplicates],
+    });
+  }
+  if (!Number.isSafeInteger(offsetMs)) {
+    throw new HttpError(
+      400,
+      'invalid_offset',
+      '偏移量必须是有符号整数毫秒（如 -500 或 2000）'
+    );
+  }
+  return { cueIds, offsetMs };
+}
+
+/** 选中段必须全部属于该作品（在同事务已加载的全量段上核对） */
+function assertCuesExist(allCues, cueIds) {
+  const found = new Set(allCues.map((c) => c.id));
+  const missing = cueIds.filter((id) => !found.has(id));
+  if (missing.length > 0) {
+    throw new HttpError(
+      404,
+      'cue_not_found',
+      `字幕段不存在或不属于该作品：${missing.join(', ')}`,
+      { missing }
+    );
+  }
+}
+
+/**
+ * 平移方案（纯计算，预览与确认共用）：
+ * 选中段整体加 offsetMs，未选段不动；在半开区间语义下（首尾相接允许）检查
+ *   1) 选中段新起点为负；
+ *   2) 调整后全部段两两交叠（选中段彼此、选中与未选都覆盖）。
+ * 返回每段调整前后时间、碰撞对象，以及整批违例汇总。
+ */
+function computeShiftPlan(allCues, cueIds, offsetMs) {
+  const selected = new Set(cueIds);
+  const byId = new Map(allCues.map((c) => [c.id, c]));
+
+  const arranged = allCues
+    .map((c) => ({
+      id: c.id,
+      idx: c.idx,
+      selected: selected.has(c.id),
+      start_ms: selected.has(c.id) ? c.start_ms + offsetMs : c.start_ms,
+      end_ms: selected.has(c.id) ? c.end_ms + offsetMs : c.end_ms,
+    }))
+    .sort((a, b) => a.start_ms - b.start_ms || a.end_ms - b.end_ms || a.id - b.id);
+
+  const cueView = (c) => ({
+    cue_id: c.id,
+    idx: c.idx,
+    selected: c.selected,
+    start_ms: c.start_ms,
+    end_ms: c.end_ms,
+    start: formatSignedMs(c.start_ms),
+    end: formatSignedMs(c.end_ms),
+  });
+
+  // 扫描线找全部交叠对（半开区间：前一段结束 == 后一段开始 不算交叠）
+  const pairs = [];
+  const active = [];
+  for (const cur of arranged) {
+    for (let k = active.length - 1; k >= 0; k--) {
+      if (active[k].end_ms <= cur.start_ms) active.splice(k, 1);
+    }
+    for (const prev of active) pairs.push({ a: cueView(prev), b: cueView(cur) });
+    active.push(cur);
+  }
+
+  const collisionsOf = new Map();
+  for (const { a, b } of pairs) {
+    if (!collisionsOf.has(a.cue_id)) collisionsOf.set(a.cue_id, []);
+    if (!collisionsOf.has(b.cue_id)) collisionsOf.set(b.cue_id, []);
+    collisionsOf.get(a.cue_id).push(b);
+    collisionsOf.get(b.cue_id).push(a);
+  }
+
+  const negative = arranged.filter((c) => c.selected && c.start_ms < 0).map(cueView);
+
+  const items = arranged
+    .filter((c) => c.selected)
+    .map((c) => {
+      const orig = byId.get(c.id);
+      return {
+        cue_id: c.id,
+        idx: c.idx,
+        before: {
+          start_ms: orig.start_ms,
+          end_ms: orig.end_ms,
+          start: formatMs(orig.start_ms),
+          end: formatMs(orig.end_ms),
+        },
+        after: {
+          start_ms: c.start_ms,
+          end_ms: c.end_ms,
+          start: formatSignedMs(c.start_ms),
+          end: formatSignedMs(c.end_ms),
+        },
+        negative_start: c.start_ms < 0,
+        collisions: collisionsOf.get(c.id) || [],
+      };
+    });
+
+  return { ok: negative.length === 0 && pairs.length === 0, items, negative, pairs };
+}
+
+/** 把方案里的违例汇总成 problems 列表（预览响应与 422 报错共用结构） */
+function shiftProblems(plan) {
+  const problems = [];
+  if (plan.negative.length > 0) {
+    problems.push({
+      code: 'negative_start',
+      message: `平移后 ${plan.negative.length} 个字幕段的开始时间为负`,
+      cues: plan.negative,
+    });
+  }
+  if (plan.pairs.length > 0) {
+    problems.push({
+      code: 'overlap',
+      message: `平移后存在 ${plan.pairs.length} 处字幕段时间交叠`,
+      pairs: plan.pairs,
+    });
+  }
+  return problems;
+}
+
 /* ------------------------------------------------------------------ */
 /* 作品：列表 / 详情 / 删除                                            */
 /* ------------------------------------------------------------------ */
@@ -290,6 +444,127 @@ app.put('/api/works/:id/cues/:cueId', (req, res, next) => {
     }
 
     res.json({ revision: outcome.revision, cue: cueRow(outcome.cue) });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* 批量平移：预览（不写库）与确认（单事务整批应用）                      */
+/* ------------------------------------------------------------------ */
+
+// 预览：返回每段调整前后时间与碰撞对象，以及确认时须携带的当前修订号
+app.post('/api/works/:id/shift/preview', (req, res, next) => {
+  try {
+    const workId = Number(req.params.id);
+    const { cueIds, offsetMs } = parseShiftParams(req.body);
+
+    const preview = db.transaction(() => {
+      const w = db.prepare('SELECT revision FROM works WHERE id = ?').get(workId);
+      if (!w) throw new HttpError(404, 'not_found', '作品不存在');
+      const allCues = db
+        .prepare('SELECT * FROM cues WHERE work_id = ? ORDER BY idx, id')
+        .all(workId);
+      assertCuesExist(allCues, cueIds);
+      return { revision: w.revision, plan: computeShiftPlan(allCues, cueIds, offsetMs) };
+    })();
+
+    res.json({
+      revision: preview.revision,
+      offset_ms: offsetMs,
+      ok: preview.plan.ok,
+      items: preview.plan.items,
+      problems: shiftProblems(preview.plan),
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+// 确认：携带预览所依据的修订号；同一事务内重算、校验并应用全部时间
+app.post('/api/works/:id/shift', (req, res, next) => {
+  try {
+    const workId = Number(req.params.id);
+    const { revision, editor } = req.body || {};
+
+    if (!Number.isInteger(revision) || revision < 1) {
+      throw new HttpError(400, 'invalid_revision', '缺少有效的作品修订号');
+    }
+    const { cueIds, offsetMs } = parseShiftParams(req.body);
+
+    const outcome = db.transaction(() => {
+      const w = db.prepare('SELECT revision FROM works WHERE id = ?').get(workId);
+      if (!w) throw new HttpError(404, 'not_found', '作品不存在');
+
+      const allCues = db
+        .prepare('SELECT * FROM cues WHERE work_id = ? ORDER BY idx, id')
+        .all(workId);
+      assertCuesExist(allCues, cueIds);
+
+      // 预览所依据的修订号已过期：拒绝按过期预览写入
+      if (w.revision !== revision) {
+        return { conflict: true, revision: w.revision };
+      }
+
+      // 事务内基于最新数据重算全部新时间；任何违例抛错 -> 整批回滚
+      const plan = computeShiftPlan(allCues, cueIds, offsetMs);
+      if (plan.negative.length > 0) {
+        throw new HttpError(
+          422,
+          'negative_start',
+          `平移后 ${plan.negative.length} 个字幕段的开始时间为负，整批未应用`,
+          { cues: plan.negative }
+        );
+      }
+      if (plan.pairs.length > 0) {
+        throw new HttpError(
+          422,
+          'overlap',
+          `平移后存在 ${plan.pairs.length} 处时间交叠，整批未应用`,
+          { pairs: plan.pairs }
+        );
+      }
+
+      // 只动时间：文字与段标识不变
+      const update = db.prepare('UPDATE cues SET start_ms = ?, end_ms = ? WHERE id = ?');
+      for (const item of plan.items) {
+        update.run(item.after.start_ms, item.after.end_ms, item.cue_id);
+      }
+
+      // 整批只推进一次修订号
+      const nextRevision = w.revision + 1;
+      db.prepare("UPDATE works SET revision = ?, updated_at = datetime('now') WHERE id = ?")
+        .run(nextRevision, workId);
+      db.prepare(
+        'INSERT INTO revisions_log (work_id, revision, editor, action) VALUES (?, ?, ?, ?)'
+      ).run(
+        workId,
+        nextRevision,
+        typeof editor === 'string' ? editor.slice(0, 80) : null,
+        'shift'
+      );
+
+      reindexCues(workId);
+      const cues = db
+        .prepare('SELECT * FROM cues WHERE work_id = ? ORDER BY idx, id')
+        .all(workId);
+      return { conflict: false, revision: nextRevision, cues };
+    }).immediate();
+
+    if (outcome.conflict) {
+      throw new HttpError(
+        409,
+        'revision_stale',
+        '修订号已过期：该作品已被其他人修改，未按过期预览写入',
+        { latest_revision: outcome.revision }
+      );
+    }
+
+    res.json({
+      revision: outcome.revision,
+      shifted: cueIds.length,
+      cues: outcome.cues.map(cueRow),
+    });
   } catch (e) {
     next(e);
   }

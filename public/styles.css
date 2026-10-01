@@ -245,3 +245,46 @@ tr.row-err input, tr.row-err textarea { border-color: var(--danger); }
   font: 12px/1.5 ui-monospace, Consolas, monospace;
   white-space: pre-wrap;
 }
+
+/* ---------------- 批量平移 ---------------- */
+
+.shift-panel {
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.shift-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.shift-head h3 { margin: 0; font-size: 14px; }
+.shift-sub { color: var(--muted); font-size: 12px; }
+
+.shift-controls {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.shift-controls label { font-size: 12.5px; color: var(--muted); }
+.shift-controls input { width: 160px; margin-top: 4px; }
+.shift-controls .primary { width: auto; margin-top: 0; }
+.shift-count { color: var(--muted); font-size: 12.5px; align-self: center; }
+
+.shift-summary { font-size: 13px; margin: 10px 0 6px; }
+.shift-summary.ok { color: var(--brand-dark); }
+.shift-summary.bad { color: var(--danger); }
+
+.shift-table { width: 100%; margin-top: 4px; }
+.shift-table th, .shift-table td { padding: 5px 8px; font-size: 12.5px; }
+.shift-table td { font-variant-numeric: tabular-nums; }
+tr.shift-bad td { background: var(--err-bg); }
+
+.col-sel { width: 34px; text-align: center; }
+td.col-sel input { margin: 0; }

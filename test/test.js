@@ -325,6 +325,235 @@ async function main() {
     assert.strictEqual(n.n, 2);
   });
 
+  /* ---------------- 批量平移 ---------------- */
+
+  const SHIFT_SRT =
+    '1\n00:00:01,000 --> 00:00:02,000\n甲\n\n' +
+    '2\n00:00:03,000 --> 00:00:04,000\n乙\n\n' +
+    '3\n00:00:05,000 --> 00:00:06,000\n丙\n\n' +
+    '4\n00:00:07,000 --> 00:00:08,000\n丁\n';
+
+  let w2;
+  let c1, c2, c3, c4;
+  await test('批量平移：上传四段作品（每段 1 秒、间隔 1 秒）', async () => {
+    const r = await call('POST', '/api/works', {
+      title: '平移测试',
+      filename: 'shift.srt',
+      content: SHIFT_SRT,
+    });
+    assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+    w2 = r.json.id;
+    const d = await call('GET', `/api/works/${w2}`);
+    [c1, c2, c3, c4] = d.json.cues.map((c) => c.id);
+  });
+
+  await test('预览：返回每段调整前后时间，无碰撞时 ok，且不写库', async () => {
+    const r = await call('POST', `/api/works/${w2}/shift/preview`, {
+      cue_ids: [c1, c2],
+      offset_ms: 500,
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.strictEqual(r.json.revision, 1);
+    assert.strictEqual(r.json.ok, true);
+    assert.strictEqual(r.json.items.length, 2);
+    const first = r.json.items.find((i) => i.cue_id === c1);
+    assert.strictEqual(first.before.start_ms, 1000);
+    assert.strictEqual(first.after.start_ms, 1500);
+    assert.strictEqual(first.after.end_ms, 2500);
+    assert.deepStrictEqual(first.collisions, []);
+
+    const d = await call('GET', `/api/works/${w2}`);
+    assert.strictEqual(d.json.work.revision, 1, '预览不应推进修订号');
+    assert.strictEqual(d.json.cues[0].start_ms, 1000, '预览不应改动时间');
+  });
+
+  await test('预览：标出与未选段的碰撞对象', async () => {
+    // 乙 3-4 前移 1.5s -> 1.5-2.5，与甲 1-2 交叠
+    const r = await call('POST', `/api/works/${w2}/shift/preview`, {
+      cue_ids: [c2],
+      offset_ms: -1500,
+    });
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.json.ok, false);
+    assert.strictEqual(r.json.items.length, 1);
+    assert.strictEqual(r.json.items[0].collisions.length, 1);
+    assert.strictEqual(r.json.items[0].collisions[0].cue_id, c1);
+    assert.strictEqual(r.json.items[0].collisions[0].selected, false);
+    assert.ok(r.json.problems.some((p) => p.code === 'overlap'));
+  });
+
+  await test('预览：新起点为负被标出', async () => {
+    const r = await call('POST', `/api/works/${w2}/shift/preview`, {
+      cue_ids: [c1],
+      offset_ms: -1500,
+    });
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.json.ok, false);
+    assert.strictEqual(r.json.items[0].negative_start, true);
+    assert.strictEqual(r.json.items[0].after.start_ms, -500);
+    assert.ok(r.json.problems.some((p) => p.code === 'negative_start'));
+  });
+
+  await test('空选择、重复段、不存在的段、非整数偏移均报错', async () => {
+    let r = await call('POST', `/api/works/${w2}/shift/preview`, {
+      cue_ids: [],
+      offset_ms: 100,
+    });
+    assert.strictEqual(r.status, 400);
+    assert.strictEqual(r.json.error, 'empty_selection');
+
+    r = await call('POST', `/api/works/${w2}/shift/preview`, {
+      cue_ids: [c1, c1],
+      offset_ms: 100,
+    });
+    assert.strictEqual(r.status, 400);
+    assert.strictEqual(r.json.error, 'duplicate_cues');
+
+    r = await call('POST', `/api/works/${w2}/shift/preview`, {
+      cue_ids: [c1, 999999],
+      offset_ms: 100,
+    });
+    assert.strictEqual(r.status, 404);
+    assert.strictEqual(r.json.error, 'cue_not_found');
+    assert.deepStrictEqual(r.json.missing, [999999]);
+
+    r = await call('POST', `/api/works/${w2}/shift/preview`, {
+      cue_ids: [c1],
+      offset_ms: 1.5,
+    });
+    assert.strictEqual(r.status, 400);
+    assert.strictEqual(r.json.error, 'invalid_offset');
+
+    r = await call('POST', `/api/works/${w2}/shift/preview`, {
+      cue_ids: [c1],
+      offset_ms: '100',
+    });
+    assert.strictEqual(r.status, 400);
+    assert.strictEqual(r.json.error, 'invalid_offset');
+  });
+
+  await test('确认：合法平移成功，修订号只 +1，文字与段标识不变', async () => {
+    const r = await call('POST', `/api/works/${w2}/shift`, {
+      cue_ids: [c1, c2],
+      offset_ms: 500,
+      revision: 1,
+      editor: '阿校',
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.strictEqual(r.json.revision, 2, '平移两段也只推进一次修订号');
+    assert.strictEqual(r.json.shifted, 2);
+
+    const d = await call('GET', `/api/works/${w2}`);
+    assert.strictEqual(d.json.work.revision, 2);
+    const byId = Object.fromEntries(d.json.cues.map((c) => [c.id, c]));
+    assert.strictEqual(byId[c1].start_ms, 1500);
+    assert.strictEqual(byId[c1].end_ms, 2500);
+    assert.strictEqual(byId[c1].text, '甲', '文字不变');
+    assert.strictEqual(byId[c2].start_ms, 3500);
+    assert.strictEqual(byId[c2].end_ms, 4500);
+    assert.strictEqual(byId[c2].text, '乙');
+  });
+
+  await test('确认：首尾相接允许', async () => {
+    // 甲当前 1.5-2.5，再后移 1s -> 2.5-3.5，与乙 3.5-4.5 首尾相接
+    const r = await call('POST', `/api/works/${w2}/shift`, {
+      cue_ids: [c1],
+      offset_ms: 1000,
+      revision: 2,
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.strictEqual(r.json.revision, 3);
+  });
+
+  await test('确认：缺少有效修订号报 400', async () => {
+    const r = await call('POST', `/api/works/${w2}/shift`, {
+      cue_ids: [c1],
+      offset_ms: 100,
+    });
+    assert.strictEqual(r.status, 400);
+    assert.strictEqual(r.json.error, 'invalid_revision');
+  });
+
+  await test('确认：与未选段交叠整批拒绝，指出相关段，修订号不变', async () => {
+    // 丙 5-6 前移 1.5s -> 3.5-4.5，与乙 3.5-4.5 重合（与甲 2.5-3.5 仅首尾相接）
+    const r = await call('POST', `/api/works/${w2}/shift`, {
+      cue_ids: [c3],
+      offset_ms: -1500,
+      revision: 3,
+    });
+    assert.strictEqual(r.status, 422);
+    assert.strictEqual(r.json.error, 'overlap');
+    assert.ok(Array.isArray(r.json.pairs) && r.json.pairs.length === 1);
+    const involved = [r.json.pairs[0].a.cue_id, r.json.pairs[0].b.cue_id].sort((a, b) => a - b);
+    assert.deepStrictEqual(involved, [c2, c3].sort((a, b) => a - b));
+
+    const d = await call('GET', `/api/works/${w2}`);
+    assert.strictEqual(d.json.work.revision, 3, '整批拒绝不应推进修订号');
+    const byId = Object.fromEntries(d.json.cues.map((c) => [c.id, c]));
+    assert.strictEqual(byId[c3].start_ms, 5000, '丙未被移动');
+  });
+
+  await test('确认：新起点为负整批拒绝并指出相关段', async () => {
+    // 甲当前 2.5-3.5，前移 5s -> 起点 -2.5
+    const r = await call('POST', `/api/works/${w2}/shift`, {
+      cue_ids: [c1],
+      offset_ms: -5000,
+      revision: 3,
+    });
+    assert.strictEqual(r.status, 422);
+    assert.strictEqual(r.json.error, 'negative_start');
+    assert.deepStrictEqual(
+      r.json.cues.map((c) => c.cue_id),
+      [c1]
+    );
+    assert.strictEqual(r.json.cues[0].start_ms, -2500);
+
+    const d = await call('GET', `/api/works/${w2}`);
+    assert.strictEqual(d.json.work.revision, 3);
+  });
+
+  await test('确认：过期修订号 409，返回最新修订号，不按过期预览写入', async () => {
+    const r = await call('POST', `/api/works/${w2}/shift`, {
+      cue_ids: [c4],
+      offset_ms: 100,
+      revision: 1,
+    });
+    assert.strictEqual(r.status, 409);
+    assert.strictEqual(r.json.error, 'revision_stale');
+    assert.strictEqual(r.json.latest_revision, 3);
+
+    const d = await call('GET', `/api/works/${w2}`);
+    const byId = Object.fromEntries(d.json.cues.map((c) => [c.id, c]));
+    assert.strictEqual(byId[c4].start_ms, 7000, '丁未被移动');
+  });
+
+  await test('确认：重排展示序号，导出 SRT 按新时间排序', async () => {
+    // 丁 7-8 前移 6.5s -> 0.5-1.5，排到最前
+    const r = await call('POST', `/api/works/${w2}/shift`, {
+      cue_ids: [c4],
+      offset_ms: -6500,
+      revision: 3,
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.strictEqual(r.json.revision, 4);
+
+    const d = await call('GET', `/api/works/${w2}`);
+    assert.strictEqual(d.json.cues[0].id, c4, '丁应排到第一位');
+    assert.strictEqual(d.json.cues[0].idx, 1);
+    assert.strictEqual(d.json.cues[0].text, '丁');
+    assert.strictEqual(d.json.cues[1].idx, 2);
+
+    const res = await fetch(`${base}/api/works/${w2}/export`);
+    assert.strictEqual(res.status, 200);
+    const body = (await res.text()).replace(/^\uFEFF/, '');
+    const blocks = body.trim().split(/\n\n/);
+    assert.strictEqual(blocks.length, 4);
+    assert.ok(
+      blocks[0].startsWith('1\n00:00:00,500 --> 00:00:01,500\n丁'),
+      '导出第一段应为平移后的丁'
+    );
+  });
+
   await test('删除作品后列表与详情都消失', async () => {
     const r = await call('DELETE', '/api/works/1');
     assert.strictEqual(r.status, 200);
