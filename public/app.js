@@ -6,8 +6,10 @@ const $ = (sel) => document.querySelector(sel);
 
 const state = {
   works: [],
-  current: null, // { work, cues, dirty:Set<cueId> }
+  current: null, // { work, cues, dirty:Set<cueId>, selection:Set<cueId> }
   editor: localStorage.getItem('srt-editor') || '',
+  // 最近一次批量平移预览：{ revision, offsetMs, cueIds, valid, stale }
+  shiftPreview: null,
 };
 
 $('#editor-name').value = state.editor;
@@ -136,11 +138,15 @@ $('#refresh-list').addEventListener('click', loadWorks);
 
 async function openWork(id) {
   const r = await api('GET', `/api/works/${id}`);
-  state.current = { work: r.work, cues: r.cues, dirty: new Set() };
+  state.current = { work: r.work, cues: r.cues, dirty: new Set(), selection: new Set() };
+  state.shiftPreview = null;
 
   $('#empty-view').hidden = true;
   $('#work-view').hidden = false;
   $('#stale-banner').hidden = true;
+  $('#shift-panel').hidden = true;
+  $('#shift-offset').value = '';
+  $('#shift-select-all').checked = false;
 
   $('#work-title-display').textContent = r.work.title;
   $('#work-filename').textContent = r.work.filename;
@@ -150,6 +156,7 @@ async function openWork(id) {
   $('#export-link').href = `/api/works/${id}/export`;
 
   renderCues();
+  updateShiftCount();
   await loadWorks();
 }
 
@@ -160,6 +167,21 @@ function renderCues() {
   for (const cue of state.current.cues) {
     const tr = document.createElement('tr');
     tr.dataset.cueId = cue.id;
+
+    // 批量平移勾选
+    const pickTd = document.createElement('td');
+    pickTd.className = 'col-pick';
+    const pick = document.createElement('input');
+    pick.type = 'checkbox';
+    pick.className = 'cue-pick';
+    pick.addEventListener('change', () => {
+      if (pick.checked) state.current.selection.add(cue.id);
+      else state.current.selection.delete(cue.id);
+      tr.classList.toggle('picked', pick.checked);
+      invalidateShiftPreview();
+      updateShiftCount();
+    });
+    pickTd.appendChild(pick);
 
     const idxTd = document.createElement('td');
     idxTd.className = 'col-idx';
@@ -213,7 +235,7 @@ function renderCues() {
     startInput.addEventListener('input', onEdit);
     endInput.addEventListener('input', onEdit);
 
-    tr.append(idxTd, startTd, endTd, textTd, saveTd);
+    tr.append(pickTd, idxTd, startTd, endTd, textTd, saveTd);
     tbody.appendChild(tr);
   }
 }
@@ -292,6 +314,8 @@ async function saveCue(tr, cue, els) {
     rowMsg.textContent = `已保存（修订号 ${r.revision}）`;
     $('#work-revision').textContent = r.revision;
     $('#stale-banner').hidden = true;
+    // 本地修订号已推进，此前的批量平移预览失效
+    invalidateShiftPreview();
   } catch (err) {
     tr.classList.add('row-err');
     rowMsg.classList.add('error');
@@ -303,6 +327,7 @@ async function saveCue(tr, cue, els) {
       $('#work-revision').textContent = err.data.latest_revision;
       $('#stale-rev').textContent = err.data.latest_revision;
       $('#stale-banner').hidden = false;
+      invalidateShiftPreview();
 
       rowMsg.innerHTML = '';
       const intro = document.createElement('div');
@@ -338,6 +363,218 @@ async function saveCue(tr, cue, els) {
     tr.classList.remove('saving');
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* 批量时间轴平移：勾选、预览、确认                                    */
+/* ------------------------------------------------------------------ */
+
+function invalidateShiftPreview() {
+  if (!state.shiftPreview) return;
+  state.shiftPreview = null;
+  const rev = $('#shift-preview-rev');
+  rev.textContent = '预览已失效（选择或偏移已变化），请重新预览';
+  rev.className = 'shift-rev stale';
+  $('#shift-confirm-btn').disabled = true;
+}
+
+function updateShiftCount() {
+  const n = state.current ? state.current.selection.size : 0;
+  $('#shift-count').textContent = `已选 ${n} 段`;
+  const all = state.current ? state.current.cues.length : 0;
+  $('#shift-select-all').checked = all > 0 && n === all;
+}
+
+$('#shift-select-all').addEventListener('change', (e) => {
+  if (!state.current) return;
+  const checked = e.target.checked;
+  state.current.selection = new Set(checked ? state.current.cues.map((c) => c.id) : []);
+  document.querySelectorAll('#cue-tbody tr').forEach((tr) => {
+    const box = tr.querySelector('.cue-pick');
+    box.checked = checked;
+    tr.classList.toggle('picked', checked);
+  });
+  invalidateShiftPreview();
+  updateShiftCount();
+});
+
+$('#shift-offset').addEventListener('input', invalidateShiftPreview);
+
+function readShiftOffset() {
+  const raw = $('#shift-offset').value.trim();
+  if (!/^[+-]?\d+$/.test(raw)) {
+    throw new Error('偏移量必须是有符号整数毫秒，例如 -500、120；不接受小数或非数字');
+  }
+  return Number(raw);
+}
+
+async function previewShift() {
+  if (!state.current) return;
+  const offset = readShiftOffset();
+  const cueIds = [...state.current.selection];
+  if (cueIds.length === 0) {
+    throw new Error('请先勾选至少一个字幕段');
+  }
+
+  const summary = $('#shift-summary');
+  summary.className = 'shift-summary';
+  summary.textContent = '计算中…';
+
+  const r = await api('POST', `/api/works/${state.current.work.id}/cues/shift/preview`, {
+    revision: state.current.work.revision,
+    cue_ids: cueIds,
+    offset_ms: offset,
+  });
+
+  state.shiftPreview = {
+    revision: r.expected_revision, // 预览所依据的作品修订号，确认时原样带回
+    offsetMs: offset,
+    cueIds,
+    valid: r.valid,
+  };
+  renderShiftPreview(r);
+}
+
+function renderShiftPreview(r) {
+  const panel = $('#shift-panel');
+  panel.hidden = false;
+  panel.classList.toggle('invalid', !r.valid);
+
+  const rev = $('#shift-preview-rev');
+  if (r.stale) {
+    rev.textContent = `预览基于修订号 ${r.expected_revision}，但当前本地修订号已不同，请重新载入后再预览`;
+    rev.className = 'shift-rev stale';
+  } else {
+    rev.textContent = `预览依据修订号：${r.expected_revision}（确认时必须与此一致）`;
+    rev.className = 'shift-rev';
+  }
+
+  const summary = $('#shift-summary');
+  const sign = r.offset_ms >= 0 ? `+${r.offset_ms}` : `${r.offset_ms}`;
+  if (r.valid) {
+    summary.className = 'shift-summary ok';
+    summary.textContent =
+      `将对 ${r.cues.length} 段统一平移 ${sign} 毫秒，文字不变；检查通过，可以确认。`;
+  } else {
+    summary.className = 'shift-summary error';
+    summary.textContent =
+      `将对 ${r.cues.length} 段统一平移 ${sign} 毫秒：存在 ${r.issues.length} 处问题，整批无法应用。`;
+  }
+
+  const issueByCue = new Map();
+  for (const issue of r.issues) {
+    for (const id of issue.cue_ids) {
+      if (!issueByCue.has(id)) issueByCue.set(id, []);
+      issueByCue.get(id).push(issue);
+    }
+  }
+
+  const tbody = $('#shift-preview-tbody');
+  tbody.innerHTML = '';
+  for (const c of r.cues) {
+    const tr = document.createElement('tr');
+    tr.className = c.negative_start || c.out_of_range || c.collisions.length > 0 ? 'bad' : 'ok';
+
+    const idxTd = document.createElement('td');
+    idxTd.textContent = `#${c.idx}`;
+
+    const beforeTd = document.createElement('td');
+    beforeTd.className = 'tc';
+    beforeTd.textContent = `${c.start}\n→ ${c.end}`;
+
+    const afterTd = document.createElement('td');
+    afterTd.className = 'tc';
+    afterTd.textContent = `${c.new_start}\n→ ${c.new_end}`;
+
+    const hitTd = document.createElement('td');
+    const parts = [];
+    if (c.negative_start) parts.push('✗ 新起点为负');
+    if (c.out_of_range) parts.push('✗ 时间超出范围');
+    if (c.collisions.length > 0) {
+      parts.push(
+        '✗ 交叠：' +
+          c.collisions.map((x) => `#${x.idx}（${x.start} → ${x.end}）`).join('；')
+      );
+    }
+    if (parts.length === 0) parts.push('无碰撞');
+    hitTd.textContent = parts.join('\n');
+
+    tr.append(idxTd, beforeTd, afterTd, hitTd);
+    tbody.appendChild(tr);
+  }
+
+  $('#shift-confirm-btn').disabled = !r.valid || r.stale;
+}
+
+$('#shift-preview-btn').addEventListener('click', async () => {
+  if (!state.current) return;
+  try {
+    await previewShift();
+  } catch (err) {
+    $('#shift-panel').hidden = false;
+    $('#shift-summary').className = 'shift-summary error';
+    $('#shift-summary').textContent = err.message;
+    $('#shift-preview-tbody').innerHTML = '';
+    $('#shift-preview-rev').textContent = '';
+    $('#shift-confirm-btn').disabled = true;
+  }
+});
+
+$('#shift-cancel-btn').addEventListener('click', () => {
+  state.shiftPreview = null;
+  $('#shift-panel').hidden = true;
+});
+
+$('#shift-confirm-btn').addEventListener('click', async () => {
+  if (!state.current || !state.shiftPreview) return;
+  const p = state.shiftPreview;
+
+  if (state.current.dirty.size > 0) {
+    if (
+      !confirm(
+        '有字幕段的单段编辑尚未保存，应用批量平移将按服务器当前时间整体重算，' +
+          '未保存的文字/时间修改可能被覆盖。确定继续？'
+      )
+    ) {
+      return;
+    }
+  }
+  const btn = $('#shift-confirm-btn');
+  btn.disabled = true;
+  try {
+    const r = await api('POST', `/api/works/${state.current.work.id}/cues/shift`, {
+      revision: p.revision, // 携带预览所依据的修订号
+      cue_ids: p.cueIds,
+      offset_ms: p.offsetMs,
+      editor: state.editor || null,
+    });
+    // 成功：按服务器重排后的结果整体刷新（openWork 会清空选择与预览状态）
+    await openWork(state.current.work.id);
+  } catch (err) {
+    btn.disabled = false;
+    const rev = $('#shift-preview-rev');
+    if (err.status === 409 && err.data.error === 'revision_stale') {
+      state.shiftPreview = null;
+      rev.textContent =
+        `作品在预览后已被其他人改动（最新修订号 ${err.data.latest_revision}），` +
+        '本次确认已拒绝。请重新载入并重新预览。';
+      rev.className = 'shift-rev stale';
+      $('#shift-summary').className = 'shift-summary error';
+      $('#shift-summary').textContent =
+        '不能按过期预览写入；请重新载入作品、重新选择并预览后再确认。';
+      btn.disabled = true;
+    } else if (err.status === 422 && err.data.issues) {
+      // 理论上预览 valid 后不会出现；若发生则要求重新预览
+      state.shiftPreview = null;
+      $('#shift-summary').className = 'shift-summary error';
+      $('#shift-summary').textContent =
+        `${err.data.message}（请重新预览）`;
+      btn.disabled = true;
+    } else {
+      $('#shift-summary').className = 'shift-summary error';
+      $('#shift-summary').textContent = err.message;
+    }
+  }
+});
 
 /* ------------------------------------------------------------------ */
 /* 离开页面前提醒未保存修改                                            */

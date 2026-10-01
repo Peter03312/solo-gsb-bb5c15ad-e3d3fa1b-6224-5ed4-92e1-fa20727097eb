@@ -17,6 +17,7 @@ const {
   formatMs,
   serializeSrt,
 } = require('./srt');
+const { planShift } = require('./shift');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'subtitles.db');
@@ -94,6 +95,73 @@ function normalizeText(text) {
     throw new HttpError(400, 'invalid_text', `字幕文字过长（上限 ${MAX_TEXT_LEN} 字）`);
   }
   return t;
+}
+
+/**
+ * 解析并校验批量平移请求的公共部分：修订号、段选择、有符号整数毫秒偏移。
+ * 返回 { revision, offsetMs, cueIds }；段是否存在/属于该作品由调用方在
+ * 事务内结合最新数据检查。
+ */
+function parseShiftBody(body) {
+  const b = body || {};
+
+  if (!Number.isInteger(b.revision) || b.revision < 1) {
+    throw new HttpError(400, 'invalid_revision', '缺少有效的作品修订号');
+  }
+
+  // 偏移量必须是整数毫秒：拒绝数字非整数、数字字符串非整数及其他类型
+  const rawOffset = b.offset_ms;
+  let offsetMs;
+  if (typeof rawOffset === 'number') {
+    offsetMs = rawOffset;
+  } else if (typeof rawOffset === 'string' && /^\s*[+-]?\d+\s*$/.test(rawOffset)) {
+    offsetMs = Number(rawOffset.trim());
+  } else {
+    throw new HttpError(400, 'invalid_offset', '偏移量必须是有符号整数毫秒（例如 -500 或 120）');
+  }
+  if (!Number.isInteger(offsetMs)) {
+    throw new HttpError(400, 'invalid_offset', '偏移量必须是整数毫秒，不接受小数');
+  }
+  if (!Number.isSafeInteger(offsetMs)) {
+    throw new HttpError(400, 'invalid_offset', '偏移量超出可表示范围');
+  }
+
+  if (!Array.isArray(b.cue_ids)) {
+    throw new HttpError(400, 'invalid_selection', 'cue_ids 必须是字幕段 ID 数组');
+  }
+  if (b.cue_ids.length === 0) {
+    throw new HttpError(400, 'empty_selection', '请至少选择一个字幕段');
+  }
+  const cueIds = [];
+  for (const v of b.cue_ids) {
+    if (!Number.isInteger(v) || v < 1) {
+      throw new HttpError(400, 'invalid_selection', '字幕段 ID 必须是正整数');
+    }
+    if (cueIds.includes(v)) {
+      throw new HttpError(400, 'duplicate_cue', `字幕段 ID ${v} 在选择中重复出现`);
+    }
+    cueIds.push(v);
+  }
+
+  return { revision: b.revision, offsetMs, cueIds };
+}
+
+/** 按 ID 列表取出作品内全部存在的字幕段；不存在或不属于该作品则 404 */
+function loadCuesForShift(workId, cueIds) {
+  const rows = db
+    .prepare('SELECT * FROM cues WHERE work_id = ? ORDER BY idx, id')
+    .all(workId);
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const missing = cueIds.filter((id) => !byId.has(id));
+  if (missing.length > 0) {
+    throw new HttpError(
+      404,
+      'cue_not_found',
+      `以下字幕段不存在或不属于该作品：${missing.join('、')}`,
+      { cue_ids: missing }
+    );
+  }
+  return rows;
 }
 
 /* ------------------------------------------------------------------ */
@@ -290,6 +358,127 @@ app.put('/api/works/:id/cues/:cueId', (req, res, next) => {
     }
 
     res.json({ revision: outcome.revision, cue: cueRow(outcome.cue) });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* 批量平移：预览（基于当前修订号推演，不写库）                        */
+/* ------------------------------------------------------------------ */
+
+app.post('/api/works/:id/cues/shift/preview', (req, res, next) => {
+  try {
+    const workId = Number(req.params.id);
+    const { revision, offsetMs, cueIds } = parseShiftBody(req.body);
+    const work = getWorkOr404(workId);
+
+    const allCues = loadCuesForShift(work.id, cueIds);
+    const plan = planShift(allCues, cueIds, offsetMs);
+
+    res.json({
+      revision: work.revision, // 预览所依据的作品修订号，确认时必须原样带回
+      expected_revision: work.revision,
+      stale: work.revision !== revision,
+      offset_ms: offsetMs,
+      cue_ids: cueIds,
+      valid: plan.valid,
+      issues: plan.issues,
+      cues: plan.entries,
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* 批量平移：确认（乐观锁 + 单事务重算应用，修订号只增加一次）         */
+/* ------------------------------------------------------------------ */
+
+app.post('/api/works/:id/cues/shift', (req, res, next) => {
+  try {
+    const workId = Number(req.params.id);
+    const { revision, offsetMs, cueIds } = parseShiftBody(req.body);
+    const { editor } = req.body || {};
+    getWorkOr404(workId);
+
+    const outcome = db
+      .transaction((wId, ids, expectedRevision, offset) => {
+        const w = db.prepare('SELECT revision FROM works WHERE id = ?').get(wId);
+        if (!w) throw new HttpError(404, 'not_found', '作品不存在');
+
+        // 预览依据的修订号与当前不一致：作品已被他人改动，拒绝按过期预览写入
+        if (w.revision !== expectedRevision) {
+          return { conflict: true, revision: w.revision };
+        }
+
+        const allRows = db
+          .prepare('SELECT * FROM cues WHERE work_id = ? ORDER BY idx, id')
+          .all(wId);
+        const byId = new Map(allRows.map((r) => [r.id, r]));
+        const missing = ids.filter((id) => !byId.has(id));
+        if (missing.length > 0) {
+          throw new HttpError(
+            404,
+            'cue_not_found',
+            `以下字幕段不存在或不属于该作品：${missing.join('、')}`,
+            { cue_ids: missing }
+          );
+        }
+
+        const plan = planShift(allRows, ids, offset);
+        if (!plan.valid) {
+          throw new HttpError(
+            422,
+            'shift_rejected',
+            '批量平移会产生负起点或时间交叠，已整批拒绝',
+            { issues: plan.issues, cues: plan.entries }
+          );
+        }
+
+        const update = db.prepare(
+          'UPDATE cues SET start_ms = ?, end_ms = ? WHERE id = ?'
+        );
+        for (const e of plan.entries) {
+          update.run(e.new_start_ms, e.new_end_ms, e.id);
+        }
+
+        const nextRevision = w.revision + 1;
+        db.prepare("UPDATE works SET revision = ?, updated_at = datetime('now') WHERE id = ?")
+          .run(nextRevision, wId);
+
+        db.prepare(
+          'INSERT INTO revisions_log (work_id, revision, editor, action) VALUES (?, ?, ?, ?)'
+        ).run(
+          wId,
+          nextRevision,
+          typeof editor === 'string' ? editor.slice(0, 80) : null,
+          `shift x${ids.length} ${offset >= 0 ? '+' : ''}${offset}ms`
+        );
+
+        // 重算并应用全部时间后，在同一事务内重排展示序号
+        reindexCues(wId);
+
+        const cues = db
+          .prepare('SELECT * FROM cues WHERE work_id = ? ORDER BY idx, id')
+          .all(wId)
+          .map(cueRow);
+        return { conflict: false, revision: nextRevision, cues };
+      })
+      .immediate(workId, cueIds, revision, offsetMs);
+
+    if (outcome.conflict) {
+      throw new HttpError(409, 'revision_stale', '修订号已过期：该作品已被其他人修改，请基于最新版本重新预览后再确认', {
+        latest_revision: outcome.revision,
+      });
+    }
+
+    res.json({
+      revision: outcome.revision,
+      offset_ms: offsetMs,
+      shifted_count: cueIds.length,
+      cues: outcome.cues,
+    });
   } catch (e) {
     next(e);
   }

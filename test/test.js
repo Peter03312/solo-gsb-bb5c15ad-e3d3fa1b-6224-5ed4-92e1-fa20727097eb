@@ -315,6 +315,247 @@ async function main() {
     );
   });
 
+  /* ---------------- 批量时间轴平移 ---------------- */
+
+  // 新作品，各段时长/间隙不同，便于区分“交叠”与“首尾相接”：
+  // #1 1000-2000  #2 3000-4000  #3 5000-7000  #4 9000-10000
+  const SHIFT_SRT =
+    '1\n00:00:01,000 --> 00:00:02,000\n甲\n\n' +
+    '2\n00:00:03,000 --> 00:00:04,000\n乙\n\n' +
+    '3\n00:00:05,000 --> 00:00:07,000\n丙\n\n' +
+    '4\n00:00:09,000 --> 00:00:10,000\n丁\n';
+  let shiftWorkId;
+  let sIds = {};
+  const byIdx = (cues, i) => cues.find((c) => c.idx === i);
+
+  await test('批量：上传测试作品（4 段，带间隙）', async () => {
+    const r = await call('POST', '/api/works', { title: '批量片', filename: 'shift.srt', content: SHIFT_SRT });
+    assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+    assert.strictEqual(r.json.revision, 1);
+    shiftWorkId = r.json.id;
+    const d = await call('GET', `/api/works/${shiftWorkId}`);
+    [1, 2, 3, 4].forEach((i) => {
+      sIds[i] = byIdx(d.json.cues, i).id;
+    });
+  });
+
+  await test('批量预览：合法后移 1000ms，返回调整前后时间，无碰撞，valid=true', async () => {
+    const r = await call('POST', `/api/works/${shiftWorkId}/cues/shift/preview`, {
+      revision: 1,
+      cue_ids: [sIds[2]],
+      offset_ms: 1000,
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.strictEqual(r.json.valid, true);
+    assert.strictEqual(r.json.expected_revision, 1);
+    assert.deepStrictEqual(r.json.issues, []);
+    const c = r.json.cues[0];
+    assert.strictEqual(c.start, '00:00:03,000');
+    assert.strictEqual(c.new_start, '00:00:04,000');
+    assert.strictEqual(c.new_end, '00:00:05,000');
+    assert.deepStrictEqual(c.collisions, []);
+  });
+
+  await test('批量预览：前移导致负起点，valid=false 并指出该段', async () => {
+    const r = await call('POST', `/api/works/${shiftWorkId}/cues/shift/preview`, {
+      revision: 1,
+      cue_ids: [sIds[1]],
+      offset_ms: -1500,
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.strictEqual(r.json.valid, false);
+    assert.strictEqual(r.json.issues[0].type, 'negative_start');
+    assert.deepStrictEqual(r.json.issues[0].cue_ids, [sIds[1]]);
+    assert.strictEqual(r.json.cues[0].new_start_ms, -500);
+  });
+
+  await test('批量预览：后移撞上下一段，碰撞对象含未选段 #3', async () => {
+    const r = await call('POST', `/api/works/${shiftWorkId}/cues/shift/preview`, {
+      revision: 1,
+      cue_ids: [sIds[2]],
+      offset_ms: 1500, // 3000-4000 -> 4500-5500，与 #3 的 5000-7000 交叠
+    });
+    assert.strictEqual(r.json.valid, false);
+    const issue = r.json.issues.find((x) => x.type === 'overlap');
+    assert.ok(issue, '应有交叠问题');
+    assert.ok(issue.cue_ids.includes(sIds[2]) && issue.cue_ids.includes(sIds[3]));
+    const entry = r.json.cues[0];
+    assert.strictEqual(entry.collisions.length, 1);
+    assert.strictEqual(entry.collisions[0].id, sIds[3]);
+    assert.strictEqual(entry.collisions[0].selected, false);
+  });
+
+  await test('批量预览：首尾相接（新起点 == 邻段结束）允许，valid=true', async () => {
+    // #4 9000-10000 前移 2000ms -> 7000-8000，新起点 7000 正好等于 #3 结束
+    const r = await call('POST', `/api/works/${shiftWorkId}/cues/shift/preview`, {
+      revision: 1,
+      cue_ids: [sIds[4]],
+      offset_ms: -2000,
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.strictEqual(r.json.valid, true);
+    assert.deepStrictEqual(r.json.cues[0].collisions, []);
+  });
+
+  await test('批量确认：多段同量平移 + 重排序号，单事务修订号只 +1', async () => {
+    // #3 5000-7000 -> 6000-8000（接 #4 起点 9000，不撞）
+    // #1 1000-2000 -> 2000-3000（接 #2 起点 3000）；#1 与 #3 交换展示顺序
+    const r = await call('POST', `/api/works/${shiftWorkId}/cues/shift`, {
+      revision: 1,
+      cue_ids: [sIds[1], sIds[3]],
+      offset_ms: 1000,
+      editor: '排片同学',
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.strictEqual(r.json.revision, 2, '整批只应增加一次修订号');
+    assert.strictEqual(r.json.shifted_count, 2);
+
+    // 返回的是按新时间重排的全部段
+    const starts = r.json.cues.map((c) => c.start);
+    assert.deepStrictEqual(starts, [
+      '00:00:02,000', // 原 #1 甲
+      '00:00:03,000', // #2 乙未选
+      '00:00:06,000', // 原 #3 丙
+      '00:00:09,000', // #4 丁未选
+    ]);
+    r.json.cues.forEach((c, i) => assert.strictEqual(c.idx, i + 1, '展示序号应从 1 连续重排'));
+
+    // 文字与段标识不变：原 #1（id 不变）仍是“甲”，原 #3 仍是“丙”
+    const c1 = r.json.cues.find((c) => c.id === sIds[1]);
+    const c3 = r.json.cues.find((c) => c.id === sIds[3]);
+    assert.strictEqual(c1.text, '甲');
+    assert.strictEqual(c3.text, '丙');
+    assert.strictEqual(c1.start_ms, 2000);
+    assert.strictEqual(c1.end_ms, 3000);
+    assert.strictEqual(c3.start_ms, 6000);
+    assert.strictEqual(c3.end_ms, 8000);
+  });
+
+  await test('批量确认后导出 SRT 按新时间排序编号', async () => {
+    const res = await fetch(base + `/api/works/${shiftWorkId}/export`);
+    const body = (await res.text()).replace(/^﻿/, '');
+    assert.ok(body.startsWith('1\n00:00:02,000'), body.slice(0, 60));
+    assert.ok(body.includes('2\n00:00:03,000 --> 00:00:04,000\n乙'));
+    assert.ok(/3\n00:00:06,000 --> 00:00:08,000\n丙/.test(body), '原 #3（丙）按新时间排到第 3 条');
+    assert.ok(/4\n00:00:09,000 --> 00:00:10,000\n丁/.test(body));
+  });
+
+  await test('批量确认：会交叠的批次 422 整批拒绝，修订号与全部时间不变', async () => {
+    // rev2 时间线：甲 2000-3000、乙 3000-4000、丙 6000-8000、丁 9000-10000
+    // 乙 +1500 -> 4500-5500，落在乙、丙之间的间隙（4000-6000），合法 -> rev3
+    const fit = await call('POST', `/api/works/${shiftWorkId}/cues/shift`, {
+      revision: 2,
+      cue_ids: [sIds[2]],
+      offset_ms: 1500,
+    });
+    assert.strictEqual(fit.status, 200, JSON.stringify(fit.json));
+    assert.strictEqual(fit.json.revision, 3);
+
+    // rev3：乙已在 4500-5500；乙再 +2500 -> 7000-8000，与丙 6000-8000 交叠
+    const bad = await call('POST', `/api/works/${shiftWorkId}/cues/shift`, {
+      revision: 3,
+      cue_ids: [sIds[2]],
+      offset_ms: 2500,
+    });
+    assert.strictEqual(bad.status, 422);
+    assert.strictEqual(bad.json.error, 'shift_rejected');
+    assert.ok(bad.json.issues.some((x) => x.type === 'overlap'));
+    assert.ok(bad.json.issues[0].cues.some((c) => c.id === sIds[2]));
+
+    const d = await call('GET', `/api/works/${shiftWorkId}`);
+    assert.strictEqual(d.json.work.revision, 3, '被拒绝的批量调整不应推进修订号');
+    const yi = byIdx(d.json.cues, 2);
+    assert.strictEqual(yi.start, '00:00:04,500'); // 前一次合法平移的结果保留
+  });
+
+  await test('批量确认：负起点 422 拒绝', async () => {
+    const r = await call('POST', `/api/works/${shiftWorkId}/cues/shift`, {
+      revision: 3,
+      cue_ids: [sIds[1]], // 甲当前 2000-3000
+      offset_ms: -3000,
+    });
+    assert.strictEqual(r.status, 422);
+    assert.strictEqual(r.json.issues[0].type, 'negative_start');
+    const d = await call('GET', `/api/works/${shiftWorkId}`);
+    assert.strictEqual(d.json.work.revision, 3);
+  });
+
+  await test('批量确认：预览后作品被单段编辑改动 -> 409 返回最新修订号，不写入', async () => {
+    // rev3 时间线：甲 2000-3000、乙 4500-5500、丙 6000-8000、丁 9000-10000
+    const before = await call('GET', `/api/works/${shiftWorkId}`);
+    const yi = byIdx(before.json.cues, 2);
+    assert.strictEqual(yi.start, '00:00:04,500');
+
+    const preview = await call('POST', `/api/works/${shiftWorkId}/cues/shift/preview`, {
+      revision: 3,
+      cue_ids: [sIds[4]], // 丁 9000-10000
+      offset_ms: -500,
+    });
+    assert.strictEqual(preview.status, 200);
+    assert.strictEqual(preview.json.valid, true);
+
+    // 他人改动同一作品：修订号推进到 4
+    const other = await call('PUT', `/api/works/${shiftWorkId}/cues/${sIds[1]}`, {
+      revision: 3,
+      start: '00:00:02,000',
+      end: '00:00:02,500',
+      text: '甲被别人改短',
+      editor: '别人',
+    });
+    assert.strictEqual(other.status, 200, JSON.stringify(other.json));
+
+    // 仍按旧预览的修订号 3 确认 -> 409
+    const confirm = await call('POST', `/api/works/${shiftWorkId}/cues/shift`, {
+      revision: 3,
+      cue_ids: [sIds[4]],
+      offset_ms: -500,
+    });
+    assert.strictEqual(confirm.status, 409);
+    assert.strictEqual(confirm.json.error, 'revision_stale');
+    assert.strictEqual(confirm.json.latest_revision, 4);
+
+    const after = await call('GET', `/api/works/${shiftWorkId}`);
+    assert.strictEqual(after.json.work.revision, 4);
+    const ding = after.json.cues.find((c) => c.id === sIds[4]);
+    assert.strictEqual(ding.start, '00:00:09,000', '丁不应被过期预览写入');
+  });
+
+  await test('批量：空选择、重复段、不存在段、非整数偏移均报错', async () => {
+    const base_ = `/api/works/${shiftWorkId}/cues/shift`;
+    const empty = await call('POST', `${base_}/preview`, { revision: 4, cue_ids: [], offset_ms: 100 });
+    assert.strictEqual(empty.status, 400);
+    assert.strictEqual(empty.json.error, 'empty_selection');
+
+    const dup = await call('POST', `${base_}/preview`, { revision: 4, cue_ids: [sIds[1], sIds[1]], offset_ms: 100 });
+    assert.strictEqual(dup.status, 400);
+    assert.strictEqual(dup.json.error, 'duplicate_cue');
+
+    const notFound = await call('POST', `${base_}/preview`, { revision: 4, cue_ids: [999999], offset_ms: 100 });
+    assert.strictEqual(notFound.status, 404);
+    assert.strictEqual(notFound.json.error, 'cue_not_found');
+
+    for (const bad of [1.5, '1.5', 'abc', null, {}, true]) {
+      const r = await call('POST', `${base_}/preview`, { revision: 4, cue_ids: [sIds[1]], offset_ms: bad });
+      assert.strictEqual(r.status, 400, `偏移量 ${JSON.stringify(bad)} 应被拒绝`);
+      assert.strictEqual(r.json.error, 'invalid_offset');
+    }
+  });
+
+  await test('批量：整数字符串偏移与 0 偏移接受；不选非数组报错', async () => {
+    const base_ = `/api/works/${shiftWorkId}/cues/shift`;
+    const str = await call('POST', `${base_}/preview`, { revision: 4, cue_ids: [sIds[2]], offset_ms: '-500' });
+    assert.strictEqual(str.status, 200, JSON.stringify(str.json));
+    assert.strictEqual(str.json.offset_ms, -500);
+
+    const zero = await call('POST', `${base_}/preview`, { revision: 4, cue_ids: [sIds[2]], offset_ms: 0 });
+    assert.strictEqual(zero.status, 200);
+    assert.strictEqual(zero.json.valid, true);
+
+    const noArr = await call('POST', `${base_}/preview`, { revision: 4, cue_ids: sIds[2], offset_ms: 0 });
+    assert.strictEqual(noArr.status, 400);
+    assert.strictEqual(noArr.json.error, 'invalid_selection');
+  });
+
   await test('持久化：用 openDb 重新打开文件，数据与修订号都在', async () => {
     const { openDb } = require('../src/db');
     const db2 = await openDb(process.env.DB_PATH);
